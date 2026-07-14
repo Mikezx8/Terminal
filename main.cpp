@@ -18,6 +18,7 @@
 #include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonArray>
 #include <QDir>
 #include <QPropertyAnimation>
 #include <QGraphicsOpacityEffect>
@@ -25,6 +26,7 @@
 #include <QCheckBox>
 #include <QLabel>
 #include <QHBoxLayout>
+#include <QGridLayout>
 #include <QLinearGradient>
 #include <QRegularExpression>
 #include <QPainterPath>
@@ -43,11 +45,28 @@
 #include <string.h>
 
 // ── ANSI colour tables ────────────────────────────────────────────────────────
-static const QColor ansi16[16] = {
+// Default 16-colour palette (Windows Terminal-style). Mutable so the settings
+// panel's terminal-theme colors can override it at runtime — every program
+// running inside this terminal (fastfetch, btop, ls, vim, ...) renders its
+// SGR 30-37/40-47/90-97/100-107 and 256-colour 0-15 codes through this table,
+// so recoloring it here recolors their output too, with no changes needed on
+// their end.
+static QColor ansi16[16] = {
     {  12, 12, 12},{197, 15, 31},{19,161, 14},{193,156, 0},
     {  0,55,218},{136, 23,152},{58,150,221},{204,204,204},
     {118,118,118},{231, 72, 86},{22,198, 12},{249,241,165},
     { 59,120,255},{180,  0,158},{97,214,214},{242,242,242}
+};
+static const QColor ansi16Defaults[16] = {
+    {  12, 12, 12},{197, 15, 31},{19,161, 14},{193,156, 0},
+    {  0,55,218},{136, 23,152},{58,150,221},{204,204,204},
+    {118,118,118},{231, 72, 86},{22,198, 12},{249,241,165},
+    { 59,120,255},{180,  0,158},{97,214,214},{242,242,242}
+};
+static const char *ansi16Names[16] = {
+    "Black","Red","Green","Yellow","Blue","Magenta","Cyan","White",
+    "Bright Black","Bright Red","Bright Green","Bright Yellow",
+    "Bright Blue","Bright Magenta","Bright Cyan","Bright White"
 };
 static QColor ansiColor(int n){
     if(n<16)  return ansi16[n];
@@ -64,6 +83,14 @@ static QColor ansiColor(int n){
 // ── Cell ─────────────────────────────────────────────────────────────────────
 struct Attr {
     QColor fg{204,204,204}, bg{0,0,0};
+    // 0-15 when fg/bg came from a basic/bright ANSI SGR code (30-37, 90-97,
+    // 38/48;5;<16) — resolved against the *live* ansi16 table at paint time
+    // instead of being baked in here, so already-printed cells (and programs
+    // like ncurses apps that set a color once and never resend the SGR code
+    // for unchanged redraws) still pick up a theme change instantly. -1 means
+    // fg/bg above is an explicit color (256-cube, truecolor, or default) and
+    // should be used as-is.
+    int fgIndex=-1, bgIndex=-1;
     bool bold=false, underline=false, italic=false, reverse=false;
 };
 struct Cell { QChar ch{' '}; Attr attr; };
@@ -474,20 +501,30 @@ private:
             else if(n==23) a.italic=false;
             else if(n==24) a.underline=false;
             else if(n==27) a.reverse=false;
-            else if(n>=30&&n<=37) a.fg=ansi16[n-30];
+            else if(n>=30&&n<=37){ a.fgIndex=n-30; a.fg=ansi16[a.fgIndex]; }
             else if(n==38){
-                if(i+2<p.size()&&p[i+1]==5){a.fg=ansiColor(p[i+2]);i+=2;}
-                else if(i+4<p.size()&&p[i+1]==2){a.fg=QColor(p[i+2],p[i+3],p[i+4]);i+=4;}
+                if(i+2<p.size()&&p[i+1]==5){
+                    int idx=p[i+2];
+                    a.fgIndex = idx<16 ? idx : -1;
+                    a.fg=ansiColor(idx);
+                    i+=2;
+                }
+                else if(i+4<p.size()&&p[i+1]==2){a.fgIndex=-1; a.fg=QColor(p[i+2],p[i+3],p[i+4]);i+=4;}
             }
-            else if(n==39) a.fg=QColor(204,204,204);
-            else if(n>=40&&n<=47) a.bg=ansi16[n-40];
+            else if(n==39){ a.fgIndex=-1; a.fg=QColor(204,204,204); }
+            else if(n>=40&&n<=47){ a.bgIndex=n-40; a.bg=ansi16[a.bgIndex]; }
             else if(n==48){
-                if(i+2<p.size()&&p[i+1]==5){a.bg=ansiColor(p[i+2]);i+=2;}
-                else if(i+4<p.size()&&p[i+1]==2){a.bg=QColor(p[i+2],p[i+3],p[i+4]);i+=4;}
+                if(i+2<p.size()&&p[i+1]==5){
+                    int idx=p[i+2];
+                    a.bgIndex = idx<16 ? idx : -1;
+                    a.bg=ansiColor(idx);
+                    i+=2;
+                }
+                else if(i+4<p.size()&&p[i+1]==2){a.bgIndex=-1; a.bg=QColor(p[i+2],p[i+3],p[i+4]);i+=4;}
             }
-            else if(n==49) a.bg=QColor(0,0,0);
-            else if(n>=90&&n<=97) a.fg=ansi16[n-90+8];
-            else if(n>=100&&n<=107) a.bg=ansi16[n-100+8];
+            else if(n==49){ a.bgIndex=-1; a.bg=QColor(0,0,0); }
+            else if(n>=90&&n<=97){ a.fgIndex=n-90+8; a.fg=ansi16[a.fgIndex]; }
+            else if(n>=100&&n<=107){ a.bgIndex=n-100+8; a.bg=ansi16[a.bgIndex]; }
         }
     }
 };
@@ -505,6 +542,14 @@ struct Theme {
     QColor   bg1{0,0,0}, bg2{26,26,46};
     bool     gradient=false;
     double   angle=45.0;
+    // Terminal ANSI palette (0-15). Defaults mirror ansi16Defaults so a fresh
+    // config matches what the terminal already renders before any customizing.
+    QColor   ansiColors[16] = {
+        {  12, 12, 12},{197, 15, 31},{19,161, 14},{193,156, 0},
+        {  0,55,218},{136, 23,152},{58,150,221},{204,204,204},
+        {118,118,118},{231, 72, 86},{22,198, 12},{249,241,165},
+        { 59,120,255},{180,  0,158},{97,214,214},{242,242,242}
+    };
 
     void loadFromJson(const QJsonObject &obj){
         if(obj.contains("highlight")) highlight=QColor(obj["highlight"].toString());
@@ -512,6 +557,13 @@ struct Theme {
         if(obj.contains("bg2"))       bg2=QColor(obj["bg2"].toString());
         if(obj.contains("gradient"))  gradient=obj["gradient"].toBool();
         if(obj.contains("angle"))     angle=obj["angle"].toDouble();
+        if(obj.contains("ansiColors")){
+            QJsonArray arr=obj["ansiColors"].toArray();
+            for(int i=0;i<16 && i<arr.size();i++){
+                QColor c(arr[i].toString());
+                if(c.isValid()) ansiColors[i]=c;
+            }
+        }
     }
 
     QJsonObject toJson() const {
@@ -521,9 +573,18 @@ struct Theme {
         o["bg2"]=bg2.name();
         o["gradient"]=gradient;
         o["angle"]=angle;
+        QJsonArray arr;
+        for(int i=0;i<16;i++) arr.append(ansiColors[i].name());
+        o["ansiColors"]=arr;
         return o;
     }
 };
+
+// Pushes theme's ANSI palette into the live global table the VT parser reads
+// from — must be called after any theme.ansiColors change to take effect.
+static void applyThemeAnsiPalette(const Theme &theme){
+    for(int i=0;i<16;i++) ansi16[i]=theme.ansiColors[i];
+}
 
 // ── TermWidget ────────────────────────────────────────────────────────────────
 class TermWidget : public QWidget {
@@ -618,6 +679,7 @@ private:
         if(!f.open(QIODevice::ReadOnly)) return;
         QJsonObject obj = QJsonDocument::fromJson(f.readAll()).object();
         theme.loadFromJson(obj);
+        applyThemeAnsiPalette(theme);
         if(obj.contains("enhancedColors")) enhancedColors=obj["enhancedColors"].toBool();
         if(obj.contains("boldAll"))        boldAll=obj["boldAll"].toBool();
         if(obj.contains("bgOpacity"))      bgOpacity=obj["bgOpacity"].toDouble(1.0);
@@ -751,8 +813,15 @@ protected:
                 const Cell &cell=(*line)[col];
                 Attr a=cell.attr;
 
-                QColor fg=a.bold&&a.fg==QColor(204,204,204)?Qt::white:a.fg;
-                QColor bg=a.bg;
+                // Resolve against the *current* palette here rather than
+                // trusting a.fg/a.bg directly — keeps already-printed cells
+                // (and anything relying on a color set once and never
+                // resent, like most ncurses apps) tracking live theme edits.
+                QColor rawFg = a.fgIndex>=0 ? ansi16[a.fgIndex] : a.fg;
+                QColor rawBg = a.bgIndex>=0 ? ansi16[a.bgIndex] : a.bg;
+
+                QColor fg=a.bold&&rawFg==QColor(204,204,204)?Qt::white:rawFg;
+                QColor bg=rawBg;
 
                 if(a.reverse) qSwap(fg,bg);
 
@@ -835,7 +904,8 @@ protected:
         QWidget::resizeEvent(ev);
         if(settingsPanel&&panelOpen){
             int pw=qMin(260,width());
-            settingsPanel->setGeometry(width()-pw,0,pw,height());
+            QPoint globalPos = mapToGlobal(QPoint(width()-pw, 0));
+            settingsPanel->setGeometry(globalPos.x(), globalPos.y(), pw, height());
         }
         int cols=qMax(1,width()/cw);
         int rows=qMax(1,height()/ch);
@@ -870,6 +940,26 @@ protected:
     }
 
 public:
+    // settingsPanel is a Qt::Popup so it gets the right anchored position
+    // (via xdg_popup positioning) next to the terminal window. But opening a
+    // modal QColorDialog while that popup still holds its implicit Wayland
+    // grab is fragile — the dialog shows and looks normal, but its result
+    // doesn't reliably propagate back (this is why every color button in
+    // this panel, not just the new ANSI ones, silently did nothing). Closing
+    // the popup first, running the dialog with no popup grab active, then
+    // reopening it afterwards avoids the conflict entirely.
+    QColor pickColor(const QColor &initial, const QString &title){
+        settingsPanel->hide();
+        panelOpen=false;
+        // DontUseNativeDialog: Qt's native/portal color picker shows fine on
+        // several Wayland compositors but silently fails to hand the picked
+        // color back to the app. Qt's own built-in dialog doesn't have that
+        // problem.
+        QColor c = QColorDialog::getColor(initial, this, title, QColorDialog::DontUseNativeDialog);
+        toggleSettings();
+        return c;
+    }
+
     void buildSettingsPanel(){
         settingsPanel = new QWidget(this, Qt::Popup);
         settingsPanel->setObjectName("settingsPanel");
@@ -960,15 +1050,63 @@ public:
             saveConfig();
         });
         connect(btnBg1, &QPushButton::clicked, [this]{
-            QColor c = QColorDialog::getColor(theme.bg1, this, "Background Color 1");
+            QColor c = pickColor(theme.bg1, "Background Color 1");
             if(c.isValid()){ theme.bg1=c; update(); saveConfig(); }
         });
         connect(btnBg2, &QPushButton::clicked, [this]{
-            QColor c = QColorDialog::getColor(theme.bg2, this, "Background Color 2");
+            QColor c = pickColor(theme.bg2, "Background Color 2");
             if(c.isValid()){ theme.bg2=c; update(); saveConfig(); }
         });
         connect(slAngle, &QSlider::valueChanged, [this](int v){
             theme.angle=v;
+            update();
+            saveConfig();
+        });
+
+        // Terminal ANSI palette — the 16 colors any program running inside
+        // this terminal (fastfetch, btop, ls, vim, ...) renders through when
+        // it emits standard SGR/256-color escape codes. Click a swatch to
+        // recolor that slot; every such program picks it up automatically,
+        // no changes needed on its end.
+        auto *lblAnsi = new QLabel("Terminal Colors (ANSI)", settingsPanel);
+        vl->addWidget(lblAnsi);
+
+        auto *ansiGrid = new QGridLayout();
+        ansiGrid->setSpacing(6);
+        auto ansiSwatchStyle = [](const QColor &c){
+            return QString("background:%1;border:1px solid #444;border-radius:4px;").arg(c.name());
+        };
+        QVector<QPushButton*> ansiButtons;
+        for(int i=0;i<16;i++){
+            auto *btn = new QPushButton(settingsPanel);
+            btn->setFixedSize(24,24);
+            btn->setToolTip(ansi16Names[i]);
+            btn->setStyleSheet(ansiSwatchStyle(theme.ansiColors[i]));
+            ansiButtons.append(btn);
+            ansiGrid->addWidget(btn, i/8, i%8);
+            connect(btn, &QPushButton::clicked, [this,btn,i,ansiSwatchStyle]{
+                QColor c = pickColor(theme.ansiColors[i], ansi16Names[i]);
+                if(c.isValid()){
+                    theme.ansiColors[i]=c;
+                    applyThemeAnsiPalette(theme);
+                    btn->setStyleSheet(ansiSwatchStyle(c));
+                    update();
+                    saveConfig();
+                }
+            });
+        }
+        auto *ansiGridWidget = new QWidget(settingsPanel);
+        ansiGridWidget->setLayout(ansiGrid);
+        vl->addWidget(ansiGridWidget);
+
+        auto *btnAnsiReset = new QPushButton("Reset Terminal Colors", settingsPanel);
+        vl->addWidget(btnAnsiReset);
+        connect(btnAnsiReset, &QPushButton::clicked, [this,ansiButtons,ansiSwatchStyle]{
+            for(int i=0;i<16;i++){
+                theme.ansiColors[i]=ansi16Defaults[i];
+                ansiButtons[i]->setStyleSheet(ansiSwatchStyle(theme.ansiColors[i]));
+            }
+            applyThemeAnsiPalette(theme);
             update();
             saveConfig();
         });
