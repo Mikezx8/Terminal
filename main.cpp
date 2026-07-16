@@ -34,6 +34,7 @@
 #include <QColorDialog>
 
 #include <cmath>
+#include <cerrno>
 
 #include <pty.h>
 #include <unistd.h>
@@ -427,9 +428,9 @@ private:
         case 'L':{ int n=qMax(1,P(0)); for(int i=0;i<n;i++) scr->scrollDown(scr->cy,scrollBot); break;}
         case 'M':{ int n=qMax(1,P(0)); for(int i=0;i<n;i++) scr->scrollUp(scr->cy,scrollBot); break;}
         case 'P':{ // delete chars
-            int n=qMax(1,P(0));
             auto &l=scr->lines[scr->cy];
-            l.remove(scr->cx,n);
+            int n=qMin(qMax(1,P(0)), l.size()-scr->cx);
+            if(n>0) l.remove(scr->cx,n);
             while(l.size()<scr->cols) l.append(Cell{});
             break;}
         case '@':{ // insert chars
@@ -701,7 +702,7 @@ private:
     }
 
 public:
-    TermWidget(QWidget *parent=nullptr):QWidget(parent){
+    TermWidget(QWidget *parent=nullptr, const QStringList &execArgs={}):QWidget(parent){
         setFocusPolicy(Qt::StrongFocus);
         setCursor(Qt::IBeamCursor);
         setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
@@ -731,7 +732,16 @@ public:
             setenv("TERM","xterm-256color",1);
             setenv("SHELL","/bin/bash",1);
             setenv("COLORTERM","truecolor",1);
-            execlp("bash","bash",nullptr);
+            if(!execArgs.isEmpty()){
+                QVector<QByteArray> owned;
+                for(const QString &a:execArgs) owned.append(a.toLocal8Bit());
+                QVector<char*> cargv;
+                for(auto &o:owned) cargv.append(o.data());
+                cargv.append(nullptr);
+                execvp(cargv[0],cargv.data());
+            } else {
+                execlp("bash","bash",nullptr);
+            }
             _exit(1);
         }
         fcntl(master,F_SETFL,O_NONBLOCK);
@@ -760,7 +770,16 @@ private slots:
     void onData(){
         char buf[8192];
         ssize_t n=read(master,buf,sizeof(buf));
-        if(n<=0) return;
+        if(n<0){
+            if(errno==EAGAIN||errno==EWOULDBLOCK||errno==EINTR) return;
+            // Any other errno (Linux ptys deliver EIO, not a clean 0-byte
+            // EOF, once the last process holding the slave side exits) means
+            // the child is gone — close instead of leaving a dead window
+            // that the notifier keeps re-firing on.
+            window()->close();
+            return;
+        }
+        if(n==0){ window()->close(); return; }
         parser->feed(QByteArray(buf,n));
         // Free scroll: topAnchorAbs is a fixed point, so there's nothing to
         // "compensate" here at all — just re-derive scrollOffset from it.
@@ -1349,12 +1368,25 @@ int main(int argc,char *argv[]){
     QApplication app(argc,argv);
     app.setApplicationName("Terminal");
 
+    // Anything left on the command line after Qt strips its own -style/
+    // -platform/etc args becomes the command to run in place of the login
+    // shell — `./terminal htop`, `./terminal -e vim file.txt`, and
+    // `./terminal ssh host` all work like every other terminal emulator's
+    // -e/direct-exec convention. A leading "-e" is just skipped, not passed
+    // through, so it doesn't end up as argv[0] of the executed command.
+    QStringList execArgs;
+    for(int i=1;i<argc;i++){
+        QString a=QString::fromLocal8Bit(argv[i]);
+        if(execArgs.isEmpty() && a=="-e") continue;
+        execArgs << a;
+    }
+
     QWidget win;
     win.setWindowTitle("Terminal");
     win.setAttribute(Qt::WA_TranslucentBackground);
     auto *layout=new QVBoxLayout(&win);
     layout->setContentsMargins(0,0,0,0);
-    auto *term=new TermWidget(&win);
+    auto *term=new TermWidget(&win, execArgs);
     layout->addWidget(term);
     win.show();
     return app.exec();
