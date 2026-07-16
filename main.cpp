@@ -702,7 +702,6 @@ private:
 
 public:
     TermWidget(QWidget *parent=nullptr):QWidget(parent){
-        setAttribute(Qt::WA_OpaquePaintEvent);
         setFocusPolicy(Qt::StrongFocus);
         setCursor(Qt::IBeamCursor);
         setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
@@ -1352,7 +1351,7 @@ int main(int argc,char *argv[]){
 
     QWidget win;
     win.setWindowTitle("Terminal");
-    win.setStyleSheet("background:#000;");
+    win.setAttribute(Qt::WA_TranslucentBackground);
     auto *layout=new QVBoxLayout(&win);
     layout->setContentsMargins(0,0,0,0);
     auto *term=new TermWidget(&win);
